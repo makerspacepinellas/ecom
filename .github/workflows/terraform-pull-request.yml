@@ -1,0 +1,151 @@
+
+# Any time a PR is opened with changes to the terraform directory, this workflow will run
+# a security scan and a terraform plan operation. The results will be posted as PR comments.
+# The security scan will fail if any high or medium severity issues are found.
+# The terraform plan will fail if any errors occur during the plan operation.
+
+
+# For the time being we don't want this workflow to run. We need to set up AWS Account IDs in
+# GH Secrets, then we can uncomment the pull_request section.
+
+on:
+  workflow_dispatch:
+#  pull_request:
+#    branches:
+#      - main
+#    paths:
+#      - 'terraform/**'
+
+jobs:
+  # https://kics.io | https://github.com/Checkmarx/kics-github-action
+  # Scans Terraform code for security issues. Creates PR Comments.
+  kics_scan:
+    permissions:
+      pull-requests: write
+      contents: read
+    env:
+      RESULTS_DIR: results-dir
+      TF_DIR: terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Create KICS Results Directory
+        run: mkdir -p ${{ env.RESULTS_DIR }}
+
+      - name: KICS Scan (Pull Request)
+        uses: Checkmarx/kics-github-action@85b2f1325cc8f0c8df31e75e6384d6694e0f1cbf
+
+        with:
+          # Where to scan and when to fail.
+          path: ${{ env.TF_DIR }}
+          fail_on: high,medium
+
+          # Comma-separated string of paths to exclude.
+          # .terraform folder causes false positives. Will only be present if terraform init has been run.
+          exclude_paths: ${{ env.TF_DIR }}/.terraform/
+
+          # Comma-separated string of queries to exclude.
+          exclude_queries: "e592a0c5-5bdb-414c-9066-5dba7cdea370"
+
+          # Create/Update GitHub PR Comments
+          enable_comments: true
+          comments_with_queries: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Generate GitHub Security Tab Report (SARIF)
+          output_formats: 'json'
+          output_path: ${{ env.RESULTS_DIR }}/
+
+      - name: Output KICS Results
+        run: |
+          cat ${{ env.RESULTS_DIR }}/results.json
+
+  # https://terraform.io
+  # Runs terraform plan and creates a PR comment with the results.
+  terraform_plan:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      TF_DIR: terraform
+    permissions:
+      pull-requests: write
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+    steps:
+      - name: Checkout Repo
+        # v3.3.0
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+
+      - name: Get Branch Name
+        id: branch-pr
+        if: github.event_name == 'pull_request'
+        run: echo "branch=${{github.event.pull_request.base.ref}}" >> $GITHUB_ENV
+
+      - name: Configure AWS Credentials
+        # v2.0.0
+        uses: aws-actions/configure-aws-credentials@e1e17a757e536f70e52b5a12b2e8d1d1c60e04ef
+        with:
+
+          # TODO We need to establish a dynamic way to get the account ID from GitHub secrets.
+          # This will let you have develop/prod environments in separate accounts.
+
+          role-to-assume: arn:aws:iam::YOUR_ACCOUNT_ID_GOES_HERE:role/GithubAccessRole
+          role-session-name: GithubDeploymentTerraformPlan
+          aws-region: us-west-2
+
+      - name: Install Terraform
+        id: install
+        # v2.0.3
+        uses: hashicorp/setup-terraform@633666f66e0061ca3b725c73b2ec20cd13a8fdd1
+        with:
+          terraform_version: 1.4.4
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -no-color -out="plan.txt"
+        continue-on-error: true
+
+      - name: Update Pull Request
+        uses: actions/github-script@v6
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform\n
+            ${process.env.PLAN}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
