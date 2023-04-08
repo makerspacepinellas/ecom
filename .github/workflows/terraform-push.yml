@@ -1,0 +1,135 @@
+# Any time a push is made to the main branch with changes to the terraform directory,
+# this workflow will run a security scan and a terraform apply operation.
+# The security scan will fail if any high or medium severity issues are found.
+# The "terraform apply" will fail if any errors occur during the apply operation.
+
+# Terraform is a "fail-forward" tool. There are no rollbacks. If a failure occurs,
+# fix the issue and re-run the workflow. It will pick up where it left off, and
+# apply the necessary changes.
+
+on:
+  workflow_dispatch:
+
+    # For the time being we don't want this workflow to run. We need to set up AWS Account IDs in
+    # GH Secrets, then we can uncomment the push section.
+    
+#  push:
+#    paths:
+#      - 'terraform/**'
+#    branches:
+#      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  
+  # KICS should fail on high or medium severity issues, halting the workflow. 
+  # As this is a push, there will be no PR comments.
+  
+  security_scan:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      TF_DIR: terraform
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repo
+        # v3.3.0
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+
+      - name: KICS Scan (on Push)
+        uses: Checkmarx/kics-github-action@85b2f1325cc8f0c8df31e75e6384d6694e0f1cbf
+        with:
+          path: ${{ env.TF_DIR }}
+          fail_on: high,medium
+
+          # Comma-separated string of paths to exclude.
+          # .terraform folder causes false positives. Will only be present if terraform init has been run.
+          exclude_paths: ${{ env.TF_DIR }}/.terraform/
+
+          # ,, Comma-separated string ,, of queries to exclude.
+          # Excluded:
+          #   - e592a0c5-5bdb-414c-9066-5dba7cdea370: "IAM Access Analyzer Not Enabled"
+          exclude_queries: "e592a0c5-5bdb-414c-9066-5dba7cdea370"
+
+  terraform_deploy:
+    # Wait for security scan to complete.
+    needs: [security_scan]
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      TF_DIR: terraform
+    # Required for GitHub OIDC / AWS Assume Role.
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./
+    steps:
+      - name: Checkout Repo
+        # v3.3.0
+        uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c
+
+      - name: Get Branch Name
+        id: branch-merge
+        run: echo "branch=${GITHUB_REF#refs/*/}" >> $GITHUB_ENV
+
+      - name: Branch Name Case Transformation
+        id: branch
+        uses: ASzc/change-string-case-action@v1
+        with:
+          string: ${{ env.branch }}
+
+      - name: Configure AWS Credentials
+        # v2.0.0
+        uses: aws-actions/configure-aws-credentials@e1e17a757e536f70e52b5a12b2e8d1d1c60e04ef
+        with:
+
+          # We get AWS Account ID from GitHub Secrets, mapping to the upper-cased branch name.
+          # For example, the "main" branch will map to the "AWS_MAIN_ACCOUNT" secret.
+          # This allows us to use separate accounts for each branch/environment.
+
+          role-to-assume: arn:aws:iam::${{secrets[format('AWS_{0}_ACCOUNT',steps.branch.outputs.uppercase)]}}:role/GithubAccessRole
+          role-session-name: GithubDeploymentPush
+          aws-region: us-west-2
+
+      - name: Install Terraform
+        id: install
+        # v2.0.3
+        uses: hashicorp/setup-terraform@633666f66e0061ca3b725c73b2ec20cd13a8fdd1
+        with:
+          terraform_version: 1.4.4
+
+      - name: Terraform Init
+        id: init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Terraform Validate
+        id: validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -no-color -out="plan.txt"
+        continue-on-error: true
+
+      - name: Terraform Plan Failed - Halt Operation
+        id: exit_on_failure
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      # Security & Syntax Checks Complete. Let's Deploy!
+
+      - name: Terraform Apply on Push
+        working-directory: ${{ env.TF_DIR }}
+        id: apply
+        run: terraform apply plan.txt
